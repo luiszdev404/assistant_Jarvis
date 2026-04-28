@@ -31,9 +31,21 @@ VOICE_NAME          = "Charon"
 
 
 def get_api_key() -> str:
-    """Load Gemini API key from config file."""
+    """Load Gemini API key (Live session) from config file."""
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
+
+
+def get_skill_api_key() -> str:
+    """Load the dedicated skill API key (gemini_api_skill) from config file.
+
+    This key is used by background skills like tech_researcher so they run
+    on a separate quota/session from the Live voice session.
+    Falls back to the main key if not present.
+    """
+    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("gemini_api_skill") or data["gemini_api_key"]
 
 
 def load_system_prompt() -> str:

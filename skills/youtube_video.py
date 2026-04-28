@@ -2,7 +2,7 @@
 skills/youtube_video.py — YouTube interactions for Jarvis2.
 
 Actions:
-  - play      : Search for and open the first non-Shorts video via xdg-open
+  - play      : Search for and open the first non-Shorts video in Brave browser
   - summarize : Fetch transcript and summarize with Gemini (URL via parameter)
   - get_info  : Scrape metadata for a given video URL
   - trending  : Show trending videos for a given region
@@ -10,6 +10,7 @@ Actions:
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,69 @@ import requests
 
 from skills.base import Skill
 
-# YouTube filter: videos only (no Shorts, playlists)
+
+class SkillError(RuntimeError):
+    """Raised when a skill cannot complete due to a configuration problem."""
+
+
+# ── Brave browser detection (resolved once, then cached) ─────────────────────
+# Stores the full command prefix, e.g. ["brave-browser"] or ["flatpak", "run", "com.brave.Browser"]
+_BRAVE_CMD: list[str] | None = None
+_BRAVE_NATIVE_BINS = ["brave-browser", "brave"]
+_BRAVE_FLATPAK_ID  = "com.brave.Browser"
+
+
+def _get_brave_cmd() -> list[str]:
+    """
+    Return the command list needed to launch Brave browser.
+    Tries native binaries first, then Flatpak.  Caches the result.
+    Raises SkillError with a clear message if Brave cannot be found.
+    """
+    global _BRAVE_CMD
+    if _BRAVE_CMD is not None:
+        return _BRAVE_CMD
+
+    # 1. Native install: brave-browser / brave
+    for binary in _BRAVE_NATIVE_BINS:
+        if shutil.which(binary):
+            _BRAVE_CMD = [binary]
+            return _BRAVE_CMD
+
+    # 2. Flatpak install: `flatpak run com.brave.Browser`
+    if shutil.which("flatpak"):
+        try:
+            result = subprocess.run(
+                ["flatpak", "list", "--app", "--columns=application"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if _BRAVE_FLATPAK_ID in result.stdout:
+                _BRAVE_CMD = ["flatpak", "run", _BRAVE_FLATPAK_ID]
+                return _BRAVE_CMD
+        except Exception:
+            pass
+
+    tried = _BRAVE_NATIVE_BINS + [f"flatpak run {_BRAVE_FLATPAK_ID}"]
+    raise SkillError(
+        "Brave browser not found. Install it or check the binary name. "
+        f"Tried: {', '.join(tried)}"
+    )
+
+
+def _open_url(url: str) -> None:
+    """Open a URL in Brave browser (no xdg-open)."""
+    cmd = _get_brave_cmd()  # raises SkillError if not found
+    try:
+        subprocess.Popen(
+            [*cmd, url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"[youtube_video] Brave launch failed: {e}")
+
+
+# ── YouTube constants ─────────────────────────────────────────────────────────
+# Filter: videos only (no Shorts, playlists)
 _YT_VIDEO_FILTER = "EgIQAQ%3D%3D"
 
 _HEADERS = {
@@ -30,18 +93,6 @@ _HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
-
-
-def _open_url(url: str) -> None:
-    """Open a URL with the system default browser (xdg-open on Linux)."""
-    try:
-        subprocess.Popen(
-            ["xdg-open", url],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        print(f"[youtube_video] xdg-open failed: {e}")
 
 
 def _extract_video_id(url: str) -> str | None:
@@ -272,7 +323,11 @@ class YouTubeSkill(Skill):
             )
             filepath.write_text(header + summary, encoding="utf-8")
             try:
-                subprocess.Popen(["xdg-open", str(filepath)])
+                subprocess.Popen(
+                    [*_get_brave_cmd(), str(filepath)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             except Exception:
                 pass
             return f"Summary complete. Saved to: {filepath}\n\n{summary}"

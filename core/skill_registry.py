@@ -17,6 +17,7 @@ from skills.web_search import WebSearchSkill
 from skills.youtube_video import YouTubeSkill
 from skills.browser_control import BrowserControlSkill
 from skills.tech_researcher import TechResearcherSkill
+from skills.music_player import MusicPlayerSkill
 
 
 class SkillRegistry:
@@ -34,6 +35,7 @@ class SkillRegistry:
             YouTubeSkill,
             BrowserControlSkill,
             TechResearcherSkill,
+            MusicPlayerSkill,
         ]
         for cls in skill_classes:
             instance = cls(api_key=api_key)
