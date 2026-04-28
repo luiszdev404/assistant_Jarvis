@@ -1,0 +1,69 @@
+# ============================================================
+#  Jarvis2 — .gitignore
+# ============================================================
+
+# ─── API Keys & Secrets ─────────────────────────────────────
+# archivo real con keys — NUNCA subir
+config/api_keys.json
+# template seguro — sí se sube
+!config/api_keys.example.json
+*.env
+.env
+.env.*
+secrets.json
+credentials.json
+
+# ─── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+
+# ─── Virtual Environment ─────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.Python
+
+# ─── Distribución / Build ───────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+wheels/
+pip-wheel-metadata/
+
+# ─── Testing & Coverage ──────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+*.cover
+*.py,cover
+coverage.xml
+nosetests.xml
+
+# ─── IDEs & Editores ─────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ─── Logs ────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Datos de usuario / Memoria ──────────────────────────────
+memory/memory.json
+
+# ─── Jupyter Notebooks (checkpoints) ────────────────────────
+.ipynb_checkpoints/
+
+# ─── Archivos temporales del SO ──────────────────────────────
+Thumbs.db
