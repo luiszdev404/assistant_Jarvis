@@ -354,7 +354,7 @@ class Jarvis:
 
         while True:
             try:
-                self.ui.write_log("SYS: 🔌 Connecting to Gemini Live...")
+                self.ui.write_log("SYS: Connecting to Gemini Live...")
                 self.ui.set_state("THINKING")
                 config = self._build_config()
 

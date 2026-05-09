@@ -1,4 +1,4 @@
-# Jarvis2
+# Jarvis
 
 Jarvis2 es un asistente de inteligencia artificial modular y orientado a eventos, diseñado específicamente para entornos Linux Fedora con escritorio GNOME. Desarrollado con una arquitectura limpia y un registro de habilidades extensible, utiliza la API de Gemini Live para proporcionar capacidades conversacionales avanzadas e integración con el sistema directamente desde la terminal.
 
