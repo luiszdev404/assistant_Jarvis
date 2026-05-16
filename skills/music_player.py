@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -34,7 +35,9 @@ import threading
 import time
 from typing import Any
 
-from core.settings import get_skill_api_key
+from google import genai
+
+from core.settings import LITE_MODEL
 from skills.base import Skill
 
 # ── MPV configuration ─────────────────────────────────────────────────────────
@@ -193,7 +196,7 @@ def _ytdlp_get_audio_url(video_url: str) -> str | None:
         return None
 
 
-def _pick_best_entry(query: str, entries: list[dict], api_key: str) -> dict | None:
+def _pick_best_entry(query: str, entries: list[dict], client) -> dict | None:
     """
     Ask Gemini to pick the best match from *entries* for the user's *query*.
     Falls back to the first entry if Gemini fails or there is only one result.
@@ -204,8 +207,6 @@ def _pick_best_entry(query: str, entries: list[dict], api_key: str) -> dict | No
         return entries[0]
 
     try:
-        from google import genai
-
         numbered = "\n".join(
             f"{i+1}. {e['title']}" for i, e in enumerate(entries)
         )
@@ -215,9 +216,8 @@ def _pick_best_entry(query: str, entries: list[dict], api_key: str) -> dict | No
             "Which result (by number) is the best match for the user's request? "
             "Reply with ONLY the number and nothing else."
         )
-        client   = genai.Client(api_key=api_key)
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model=LITE_MODEL,
             contents=prompt,
         )
         raw = response.text.strip()
@@ -242,8 +242,8 @@ class MusicPlayerSkill(Skill):
     """
 
     def __init__(self, api_key: str | None = None) -> None:
-        # Always prefer the dedicated skill key
-        super().__init__(api_key=get_skill_api_key())
+        super().__init__(api_key=api_key)
+        self._client = genai.Client(api_key=self.api_key) if self.api_key else None
 
     TOOL_DECLARATION = {
         "name": "music_player",
@@ -305,7 +305,7 @@ class MusicPlayerSkill(Skill):
         if not entries:
             return f"Could not find any results for: {query}"
 
-        best = _pick_best_entry(query, entries, self.api_key)
+        best = _pick_best_entry(query, entries, self._client)
         if not best:
             return f"Could not resolve a playable result for: {query}"
 
@@ -374,7 +374,7 @@ class MusicPlayerSkill(Skill):
         else:
             # IPC not available – send SIGSTOP as fallback
             try:
-                _session["process"].send_signal(__import__("signal").SIGSTOP)
+                _session["process"].send_signal(signal.SIGSTOP)
             except Exception:
                 pass
 
@@ -395,7 +395,7 @@ class MusicPlayerSkill(Skill):
             _set_property(sock, "pause", False)
         else:
             try:
-                _session["process"].send_signal(__import__("signal").SIGCONT)
+                _session["process"].send_signal(signal.SIGCONT)
             except Exception:
                 pass
 

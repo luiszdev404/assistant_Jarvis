@@ -103,7 +103,10 @@ def _resolve_browser(name: str) -> dict | None:
 
 
 def _detect_default_browser() -> str:
-    """Detect the system default browser on Linux."""
+    """Return the preferred browser. Brave is always preferred when installed."""
+    for b in ("brave-browser", "brave"):
+        if shutil.which(b):
+            return "brave"
     try:
         out = subprocess.run(
             ["xdg-settings", "get", "default-web-browser"],

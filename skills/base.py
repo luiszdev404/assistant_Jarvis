@@ -38,3 +38,13 @@ class Skill(ABC):
     def log(self, msg: str) -> None:
         """Simple stdout logger with skill name prefix."""
         print(f"[{self.__class__.__name__}] {msg}")
+
+
+def _get_ddgs():
+    """Return the DDGS class, preferring the ddgs package over duckduckgo_search."""
+    try:
+        from ddgs import DDGS
+        return DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
+        return DDGS

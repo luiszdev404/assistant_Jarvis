@@ -4,7 +4,7 @@ skills/tech_researcher.py — Automated tech research with Obsidian Markdown out
 This skill:
   1. Searches multiple sources (Gemini grounding + DuckDuckGo)
   2. Synthesizes the information into a structured research document
-  3. Saves it as Obsidian-compatible Markdown to ~/Documents/Obsidian/Jarvis-Research/
+  3. Saves it as Obsidian-compatible Markdown to ~/Obsidian/Jarvis-Research/
   4. Optionally opens the file in Obsidian or the default text editor
 
 Obsidian features used:
@@ -13,15 +13,8 @@ Obsidian features used:
   - WikiLinks for related topics [[topic]]
   - Sections: Introduction, Key Concepts, Deep Dive, Trends, References
 
-MEJORAS v2:
-  - Guiones de YouTube SIEMPRE en español, sin excepciones
-  - Hooks virales diseñados para máxima retención (primeros 3-5 segundos)
-  - Cada sección incluye 📽️ NOTA DE PRODUCCIÓN con recomendaciones visuales/de edición
-
-MEJORAS v3:
-  - Usa gemini_api_skill (API key dedicada para skills, separada de la sesión Live)
-  - execute() lanza la investigación en un daemon thread y retorna inmediatamente,
-    de modo que Jarvis permanece completamente reactivo durante el proceso.
+Runs in a background daemon thread so Jarvis stays fully responsive.
+Uses the dedicated gemini_api_skill API key (separate quota from the Live session).
 """
 from __future__ import annotations
 
@@ -31,14 +24,29 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
-from core.settings import OBSIDIAN_VAULT, get_skill_api_key
-from skills.base import Skill
+from google import genai
 
-# ── Active background tasks tracker ───────────────────────────────────────────
-# Maps task_id -> {"topic": str, "status": "running"|"done"|"error", "result": str}
-_background_tasks: dict[str, dict] = {}
-_tasks_lock = threading.Lock()
+from core.settings import OBSIDIAN_BASE, OBSIDIAN_VAULT, TEXT_MODEL, LITE_MODEL
+from skills.base import Skill, _get_ddgs
+
+# ── Module-level constants ─────────────────────────────────────────────────────
+
+# Prefix that signals main.py to send the result as a separate client turn
+# so Gemini reads it aloud instead of just acknowledging the function response.
+_READ_PREFIX = "__JARVIS_READ__:"
+
+_TYPE_LABELS: dict[str, str] = {
+    "note":           "research note",
+    "youtube_script": "YouTube script",
+    "blog_post":      "blog post",
+    "guide":          "guide",
+}
+
+# ── Last generated document (for read_last action) ────────────────────────────
+_last_result: dict | None = None
+_last_result_lock = threading.Lock()
 
 
 def _sanitize_filename(title: str) -> str:
@@ -48,12 +56,14 @@ def _sanitize_filename(title: str) -> str:
     return safe[:80]
 
 
-def _open_file(filepath: Path) -> None:
+def _open_file(filepath: Path, vault_root: Path | None = None) -> None:
     """Open file with Obsidian URI scheme if available, else xdg-open."""
     try:
         import shutil
-        if shutil.which("obsidian"):
-            uri = f"obsidian://open?path={filepath}"
+        if shutil.which("obsidian") and vault_root is not None:
+            vault_name = vault_root.name
+            rel_file = filepath.relative_to(vault_root)
+            uri = f"obsidian://open?vault={vault_name}&file={rel_file}"
             subprocess.Popen(
                 ["obsidian", uri],
                 stdout=subprocess.DEVNULL,
@@ -77,12 +87,13 @@ class TechResearcherSkill(Skill):
 
     The heavy Gemini calls run in a background daemon thread so Jarvis stays
     fully responsive during the research process. Uses the dedicated
-    ``gemini_api_skill`` API key from config/api_keys.json.
+    ``gemini_api_skill`` API key passed in by the SkillRegistry.
     """
 
     def __init__(self, api_key: str | None = None) -> None:
-        # Always use the dedicated skill key; ignore the Live session key passed in
-        super().__init__(api_key=get_skill_api_key())
+        super().__init__(api_key=api_key)
+        self.notify_fn: Callable[[str], None] | None = None
+        self._client = genai.Client(api_key=self.api_key) if self.api_key else None
 
     TOOL_DECLARATION = {
         "name": "tech_researcher",
@@ -90,11 +101,19 @@ class TechResearcherSkill(Skill):
             "Research any technology topic in depth and generate a structured Markdown note "
             "for Obsidian. Covers: concepts, trends, use cases, pros/cons, references. "
             "Also generates structured content like YouTube scripts, blog posts, or guides. "
-            "Use when the user asks to research, investigate, or create content about a tech topic."
+            "Use when the user asks to research, investigate, or create content about a tech topic. "
+            "Use action='read_last' when the user wants to hear the last generated document read aloud."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": (
+                        "research (default) — generate a new document. "
+                        "read_last — return the last generated document so it can be read aloud."
+                    ),
+                },
                 "topic": {
                     "type": "STRING",
                     "description": "The technology topic to research (e.g. 'Rust programming language', 'WebAssembly')",
@@ -121,7 +140,7 @@ class TechResearcherSkill(Skill):
                     "description": "Language for the document content: en (default) | es | fr | de | pt",
                 },
             },
-            "required": ["topic"],
+            "required": [],
         },
     }
 
@@ -129,11 +148,9 @@ class TechResearcherSkill(Skill):
 
     def _search_web(self, query: str) -> str:
         """Search with Gemini grounding; fall back to DuckDuckGo."""
-        from google import genai
         try:
-            client   = genai.Client(api_key=self.api_key)
-            response = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
+            response = self._client.models.generate_content(
+                model=LITE_MODEL,
                 contents=query,
                 config={"tools": [{"google_search": {}}]},
             )
@@ -148,10 +165,7 @@ class TechResearcherSkill(Skill):
 
         # DuckDuckGo fallback
         try:
-            try:
-                from ddgs import DDGS
-            except ImportError:
-                from duckduckgo_search import DDGS
+            DDGS = _get_ddgs()
             results = []
             with DDGS() as ddgs:
                 for r in ddgs.text(query, max_results=8):
@@ -169,8 +183,6 @@ class TechResearcherSkill(Skill):
         web_context: str,
     ) -> str:
         """Use Gemini to synthesize research into structured Markdown."""
-        from google import genai
-
         depth_instructions = {
             "brief":    "Crea una descripción concisa (500-800 palabras)." if output_type == "youtube_script" else "Create a concise overview (500-800 words).",
             "standard": "Crea un guión completo (1000-1500 palabras)." if output_type == "youtube_script" else "Create a comprehensive note (1000-1500 words).",
@@ -291,9 +303,8 @@ Requirements:
 {"- NO emojis anywhere in the script, not even in section titles or production notes" if output_type == "youtube_script" else ""}
 {"- Use short sentences, fast rhythm, real-world analogies. Avoid marketing language." if output_type == "youtube_script" else ""}
 """
-        client   = genai.Client(api_key=self.api_key)
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
+        response = self._client.models.generate_content(
+            model=TEXT_MODEL,
             contents=prompt,
         )
         return response.text.strip()
@@ -303,7 +314,7 @@ Requirements:
         if content.startswith("---"):
             return content
 
-        now  = datetime.now()
+        now = datetime.now()
 
         if output_type == "youtube_script":
             tags = [
@@ -343,12 +354,46 @@ Requirements:
 
     # ── Main execute ───────────────────────────────────────────────────────────
 
-    def execute(self, params: dict) -> str:
-        """Launch research in the background and return immediately.
+    def _read_last(self) -> str:
+        """Return a short spoken summary of the last generated document."""
+        global _last_result
+        with _last_result_lock:
+            if _last_result is None:
+                return "No document has been generated yet in this session."
+            content     = _last_result["content"]
+            topic       = _last_result["topic"]
+            output_type = _last_result.get("output_type", "note")
 
-        Jarvis stays fully responsive while the research compiles in a
-        daemon thread using the dedicated ``gemini_api_skill`` key.
-        """
+        # Strip YAML frontmatter
+        if content.startswith("---"):
+            end = content.find("---", 3)
+            if end != -1:
+                content = content[end + 3:].strip()
+
+        if output_type == "youtube_script":
+            instruction = (
+                f"Resume el siguiente guión de YouTube sobre \"{topic}\" en exactamente 4 puntos clave, "
+                f"como si se lo explicaras a alguien en 30 segundos. "
+                f"Texto plano, sin markdown, sin numeración visible. "
+                f"Empieza directamente con el primer punto, sin introducción."
+            )
+        else:
+            instruction = (
+                f"Resume el siguiente documento sobre \"{topic}\" en 3-4 ideas principales, "
+                f"en texto plano para leer en voz alta. Sin markdown, sin numeración. "
+                f"Máximo 80 palabras. Empieza directamente, sin introducción."
+            )
+
+        reading_prompt = f"{instruction}\n\n{content[:6000]}"
+        return f"{_READ_PREFIX}{reading_prompt}"
+
+    def execute(self, params: dict) -> str:
+        """Launch research in the background and return immediately."""
+        action = params.get("action", "research").lower().strip()
+
+        if action == "read_last":
+            return self._read_last()
+
         topic       = params.get("topic", "").strip()
         output_type = params.get("output_type", "note").lower().strip()
         depth       = params.get("depth", "standard").lower().strip()
@@ -366,15 +411,7 @@ Requirements:
         # Guiones de YouTube siempre en español, sin importar el parámetro `language`
         effective_language = "es" if output_type == "youtube_script" else language
 
-        # Unique ID to track this background job
         task_id = str(uuid.uuid4())[:8]
-        with _tasks_lock:
-            _background_tasks[task_id] = {
-                "topic":  topic,
-                "status": "running",
-                "result": "",
-            }
-
         self.log(f"[{task_id}] Launching background research: '{topic}' | type={output_type} | depth={depth} | lang={effective_language}")
 
         # ── Background worker ──────────────────────────────────────────────────
@@ -410,39 +447,44 @@ Requirements:
                 self.log(f"[{task_id}] Saved to: {filepath}")
 
                 if should_open:
-                    _open_file(filepath)
+                    _open_file(filepath, vault_root=OBSIDIAN_BASE)
 
                 word_count = len(content.split())
-                summary = (
-                    f"Research complete. Generated {output_type} on '{topic}' "
-                    f"({word_count} words, {depth} depth). "
-                    f"Saved to: {filepath}"
-                )
-                with _tasks_lock:
-                    _background_tasks[task_id]["status"] = "done"
-                    _background_tasks[task_id]["result"] = summary
-                self.log(f"[{task_id}] Done — {summary}")
+                self.log(f"[{task_id}] Done — {word_count} words.")
+
+                # Store content for read_last action
+                global _last_result
+                with _last_result_lock:
+                    _last_result = {
+                        "topic":       topic,
+                        "output_type": output_type,
+                        "content":     content,
+                        "filepath":    str(filepath),
+                        "word_count":  word_count,
+                    }
+
+                if self.notify_fn:
+                    type_label = _TYPE_LABELS.get(output_type, output_type)
+                    self.notify_fn(
+                        f"[BACKGROUND TASK COMPLETE] El {type_label} sobre \"{topic}\" "
+                        f"está listo ({word_count} palabras). "
+                        f"Informa al usuario en una frase corta y pregunta si quiere escuchar el resumen."
+                    )
 
             except Exception as e:  # noqa: BLE001
-                error_msg = f"Research failed for '{topic}': {e}"
-                with _tasks_lock:
-                    _background_tasks[task_id]["status"] = "error"
-                    _background_tasks[task_id]["result"] = error_msg
                 self.log(f"[{task_id}] ERROR: {e}")
+                if self.notify_fn:
+                    self.notify_fn(
+                        f"[BACKGROUND TASK FAILED] Research on \"{topic}\" failed: {e}. "
+                        f"Inform the user briefly."
+                    )
 
         thread = threading.Thread(target=_run, daemon=True, name=f"TechResearch-{task_id}")
         thread.start()
 
-        # Return immediately — Jarvis stays responsive
-        type_label = {
-            "note":           "research note",
-            "youtube_script": "YouTube script",
-            "blog_post":      "blog post",
-            "guide":          "guide",
-        }.get(output_type, output_type)
-
+        type_label = _TYPE_LABELS.get(output_type, output_type)
         return (
-            f"Got it! I've started researching '{topic}' in the background (task {task_id}). "
-            f"I'll generate a {type_label} ({depth} depth) and save it to your Obsidian vault "
-            f"when it's ready. You can keep talking to me in the meantime."
+            f"[BUSCANDO EN SEGUNDO PLANO] Investigando '{topic}' — tipo: {type_label}. "
+            f"El documento estará listo en unos minutos. "
+            f"NO generes ni resumas el contenido desde tu memoria — espera el resultado real."
         )

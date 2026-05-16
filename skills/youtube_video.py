@@ -17,7 +17,9 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 import requests
+from google import genai
 
+from core.settings import TEXT_MODEL
 from skills.base import Skill
 
 
@@ -28,7 +30,7 @@ class SkillError(RuntimeError):
 # ── Brave browser detection (resolved once, then cached) ─────────────────────
 # Stores the full command prefix, e.g. ["brave-browser"] or ["flatpak", "run", "com.brave.Browser"]
 _BRAVE_CMD: list[str] | None = None
-_BRAVE_NATIVE_BINS = ["brave-browser", "brave"]
+_BRAVE_NATIVE_BINS = ["brave", "brave-browser"]
 _BRAVE_FLATPAK_ID  = "com.brave.Browser"
 
 
@@ -217,6 +219,10 @@ def _get_transcript(video_id: str) -> str | None:
 class YouTubeSkill(Skill):
     """Interact with YouTube: play, summarize, get info, trending."""
 
+    def __init__(self, api_key: str | None = None) -> None:
+        super().__init__(api_key=api_key)
+        self._client = genai.Client(api_key=self.api_key) if self.api_key else None
+
     TOOL_DECLARATION = {
         "name": "youtube_video",
         "description": (
@@ -293,12 +299,10 @@ class YouTubeSkill(Skill):
 
         self.log("Summarizing with Gemini...")
         try:
-            from google import genai
-            client   = genai.Client(api_key=self.api_key)
             max_chars = 80_000
             truncated = transcript[:max_chars] + ("..." if len(transcript) > max_chars else "")
-            response  = client.models.generate_content(
-                model="gemini-2.5-flash",
+            response  = self._client.models.generate_content(
+                model=TEXT_MODEL,
                 contents=(
                     "You are JARVIS, an AI assistant. "
                     "Summarize this YouTube video transcript clearly and concisely. "

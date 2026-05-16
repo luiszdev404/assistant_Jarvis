@@ -16,8 +16,11 @@ Flow:
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import sys
 import threading
+import time
 import traceback
 from datetime import datetime
 
@@ -27,6 +30,7 @@ from google.genai import types
 
 from core.settings import (
     get_api_key,
+    get_skill_api_key,
     load_system_prompt,
     LIVE_MODEL,
     CHANNELS,
@@ -36,7 +40,13 @@ from core.settings import (
     VOICE_NAME,
 )
 from core.skill_registry import SkillRegistry
-from memory.memory_manager import load_memory, update_memory, format_memory_for_prompt
+
+_STOP_WORDS = frozenset({"para", "detente", "cancela", "basta", "stop", "olvídalo", "olvida"})
+from memory.memory_manager import (
+    load_memory, update_memory, format_memory_for_prompt,
+    forget_memory, recall_memory, expire_memory,
+)
+from skills.tech_researcher import _READ_PREFIX
 from ui import JarvisUI
 
 
@@ -50,13 +60,14 @@ def _clean_transcript(text: str) -> str:
     return text.strip()
 
 
-# ── Save-memory tool declaration ───────────────────────────────────────────────
+# ── Memory tool declarations ───────────────────────────────────────────────────
 _SAVE_MEMORY_DECLARATION = {
     "name": "save_memory",
     "description": (
-        "Save an important personal fact about the user to long-term memory. "
-        "Call silently whenever the user reveals: name, age, city, job, preferences, "
-        "hobbies, projects, or future plans. Do NOT announce that you are saving."
+        "Save an important fact about the user to long-term memory. "
+        "Call silently whenever the user reveals personal info, preferences, projects, "
+        "routines, tech stack, or plans. Do NOT announce that you are saving. "
+        "Use expires_in_days for temporary context (e.g. 'this week I am working on X' → 7 days)."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -64,13 +75,57 @@ _SAVE_MEMORY_DECLARATION = {
             "category": {
                 "type": "STRING",
                 "description": (
-                    "identity | preferences | projects | relationships | wishes | notes"
+                    "identity (name, age, location, occupation) | "
+                    "preferences (music, news, food, language, communication style) | "
+                    "proyectos (active projects with status) | "
+                    "stack (programming languages, tools, frameworks) | "
+                    "rutinas (work hours, habits, schedule) | "
+                    "relaciones (important people mentioned) | "
+                    "contexto (current week task — use expires_in_days=7) | "
+                    "notas (anything else)"
                 ),
             },
-            "key":   {"type": "STRING", "description": "Short snake_case key (e.g. name, city)"},
-            "value": {"type": "STRING", "description": "Concise value in English"},
+            "key":   {"type": "STRING", "description": "Short snake_case key (e.g. nombre, ciudad, ide_favorito)"},
+            "value": {"type": "STRING", "description": "Concise value in Spanish"},
+            "expires_in_days": {
+                "type": "INTEGER",
+                "description": "Optional TTL in days. Use for temporary context like current tasks or weekly plans.",
+            },
         },
         "required": ["category", "key", "value"],
+    },
+}
+
+_FORGET_MEMORY_DECLARATION = {
+    "name": "forget_memory",
+    "description": (
+        "Delete a specific memory entry or an entire category. "
+        "Call when the user says 'olvida que...', 'borra que...', or corrects outdated info."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "category": {"type": "STRING", "description": "The category to target"},
+            "key":      {"type": "STRING", "description": "The specific key to delete. Omit to delete the entire category."},
+        },
+        "required": ["category"],
+    },
+}
+
+_RECALL_MEMORY_DECLARATION = {
+    "name": "recall_memory",
+    "description": (
+        "Query long-term memory. Use when the user asks what you remember, "
+        "or when you need to retrieve a specific fact before answering. "
+        "Provide either a keyword query or a category name."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "query":    {"type": "STRING", "description": "Keyword to search across all memory"},
+            "category": {"type": "STRING", "description": "Return all entries in this category"},
+        },
+        "required": [],
     },
 }
 
@@ -92,7 +147,10 @@ class Jarvis:
     def __init__(self, ui: JarvisUI) -> None:
         self.ui              = ui
         self.api_key         = get_api_key()
-        self.registry        = SkillRegistry(api_key=self.api_key)
+        self.registry        = SkillRegistry(
+            api_key=self.api_key,
+            skill_api_key=get_skill_api_key(),
+        )
         self.session         = None
         self.audio_in_queue  = None
         self.out_queue       = None
@@ -100,20 +158,18 @@ class Jarvis:
         self._is_speaking    = False
         self._speaking_lock  = threading.Lock()
 
-        self.ui.on_text_command = self._on_text_command
+        self.ui.on_text_command = self.speak
+        self._pending_read: str | None = None
+
+        # Wire completion notifications from background skills to the voice session
+        self.registry.register_notify_fn(("tech_researcher", "news_journalist"), self.speak)
+
+        # Purge expired memory entries on every startup
+        removed = expire_memory()
+        if removed:
+            self.ui.write_log(f"SYS: Expired {removed} memory entries.")
 
     # ── UI callbacks ───────────────────────────────────────────────────────────
-
-    def _on_text_command(self, text: str) -> None:
-        if not self._loop or not self.session:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True,
-            ),
-            self._loop,
-        )
 
     def set_speaking(self, value: bool) -> None:
         with self._speaking_lock:
@@ -156,7 +212,12 @@ class Jarvis:
 
         # Combine skill declarations + built-in declarations
         skill_declarations = self.registry.get_tool_declarations()
-        all_declarations   = skill_declarations + [_SAVE_MEMORY_DECLARATION, _SHUTDOWN_DECLARATION]
+        all_declarations   = skill_declarations + [
+            _SAVE_MEMORY_DECLARATION,
+            _FORGET_MEMORY_DECLARATION,
+            _RECALL_MEMORY_DECLARATION,
+            _SHUTDOWN_DECLARATION,
+        ]
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -170,8 +231,9 @@ class Jarvis:
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
                         voice_name=VOICE_NAME
                     )
-                )
+                ),
             ),
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
 
     # ── Tool execution ─────────────────────────────────────────────────────────
@@ -185,12 +247,16 @@ class Jarvis:
 
         # Built-in: save_memory (silent, fast)
         if name == "save_memory":
-            category = args.get("category", "notes")
-            key      = args.get("key", "")
-            value    = args.get("value", "")
+            category       = args.get("category", "notas")
+            key            = args.get("key", "")
+            value          = args.get("value", "")
+            expires_in_days = args.get("expires_in_days")
             if key and value:
-                update_memory({category: {key: {"value": value}}})
-                self.ui.write_log(f"SYS: saved {category}/{key}")
+                update_memory(
+                    {category: {key: {"value": value}}},
+                    expires_in_days=int(expires_in_days) if expires_in_days else None,
+                )
+                self.ui.write_log(f"SYS: memory saved {category}/{key}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return types.FunctionResponse(
@@ -198,12 +264,37 @@ class Jarvis:
                 response={"result": "ok", "silent": True},
             )
 
+        # Built-in: forget_memory
+        if name == "forget_memory":
+            category = args.get("category", "")
+            key      = args.get("key")
+            result   = forget_memory(category, key or None)
+            self.ui.write_log(f"SYS: forget_memory {category}/{key} → {result}")
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": result},
+            )
+
+        # Built-in: recall_memory
+        if name == "recall_memory":
+            query    = args.get("query")
+            category = args.get("category")
+            result   = recall_memory(query=query, category=category)
+            self.ui.write_log(f"SYS: recall_memory query={query} cat={category}")
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": result},
+            )
+
         # Built-in: shutdown
         if name == "shutdown_jarvis":
             self.ui.write_log("SYS: Shutdown requested.")
             self.speak("Goodbye, sir. Shutting down.")
             def _exit():
-                import time, os
                 time.sleep(1.5)
                 os._exit(0)
             threading.Thread(target=_exit, daemon=True).start()
@@ -213,7 +304,7 @@ class Jarvis:
             )
 
         # Skill dispatch
-        loop   = asyncio.get_event_loop()
+        loop   = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None, lambda: self.registry.execute(name, args)
         )
@@ -221,6 +312,13 @@ class Jarvis:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
+        # If the skill returned content to be read aloud, intercept it.
+        # We store it and send it as a client turn AFTER the tool response so
+        # Gemini reads it as a new instruction rather than just acknowledging
+        # the function response.
+        if isinstance(result, str) and result.startswith(_READ_PREFIX):
+            self._pending_read = result[len(_READ_PREFIX):]
+            result = "Sending the document for reading."
 
         return types.FunctionResponse(
             id=fc.id, name=name,
@@ -235,7 +333,7 @@ class Jarvis:
             await self.session.send_realtime_input(media=msg)
 
     async def _listen_audio(self) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _safe_enqueue(item: dict) -> None:
             """Put audio frame in queue, silently drop if it gets too large."""
@@ -248,9 +346,7 @@ class Jarvis:
             self.out_queue.put_nowait(item)
 
         def callback(indata, frames, time_info, status):
-            with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted:
+            if not self.ui.muted:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     _safe_enqueue,
@@ -268,6 +364,19 @@ class Jarvis:
             while True:
                 await asyncio.sleep(0.1)
 
+    def _drain_audio(self) -> None:
+        """Drain buffered audio so playback stops immediately on interruption."""
+        drained = 0
+        while not self.audio_in_queue.empty():
+            try:
+                self.audio_in_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        if drained:
+            self.ui.write_log(f"SYS: Drained {drained} audio chunks.")
+        self.set_speaking(False)
+
     async def _receive_audio(self) -> None:
         out_buf, in_buf = [], []
 
@@ -280,6 +389,10 @@ class Jarvis:
 
                     if response.server_content:
                         sc = response.server_content
+
+                        # Gemini native interruption signal — drain buffered audio immediately
+                        if getattr(sc, "interrupted", False):
+                            self._drain_audio()
 
                         if sc.output_transcription and sc.output_transcription.text:
                             self.set_speaking(True)
@@ -295,9 +408,16 @@ class Jarvis:
                                         out_buf.append(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
+                            # User spoke while Jarvis was talking — drain buffered audio
+                            if self._is_speaking:
+                                self._drain_audio()
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
                                 in_buf.append(txt)
+                                # Cancel background tasks if user said a stop word
+                                words = set(txt.lower().split())
+                                if words & _STOP_WORDS:
+                                    self.registry.cancel_background_tasks()
 
                         if sc.turn_complete:
                             self.set_speaking(False)
@@ -319,9 +439,17 @@ class Jarvis:
                             fn_responses.append(fr)
                         await self.session.send_tool_response(function_responses=fn_responses)
 
+                        # Send any pending read content as a new client turn so
+                        # Gemini reads it aloud instead of just acknowledging it.
+                        if self._pending_read:
+                            await self.session.send_client_content(
+                                turns={"parts": [{"text": self._pending_read}]},
+                                turn_complete=True,
+                            )
+                            self._pending_read = None
+
         except Exception as e:
             self.ui.write_log(f"ERR: receive — {e}")
-            traceback.print_exc()
             raise
 
     async def _play_audio(self) -> None:
@@ -347,13 +475,16 @@ class Jarvis:
     # ── Main run loop ──────────────────────────────────────────────────────────
 
     async def run(self) -> None:
-        client = genai.Client(
-            api_key=self.api_key,
-            http_options={"api_version": "v1beta"},
-        )
-
         while True:
             try:
+                # Re-read key each cycle so changes to api_keys.json take effect
+                # without restarting Jarvis.
+                self.api_key = get_api_key()
+                client = genai.Client(
+                    api_key=self.api_key,
+                    http_options={"api_version": "v1beta"},
+                )
+
                 self.ui.write_log("SYS: Connecting to Gemini Live...")
                 self.ui.set_state("THINKING")
                 config = self._build_config()
@@ -363,7 +494,7 @@ class Jarvis:
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session        = session
-                    self._loop          = asyncio.get_event_loop()
+                    self._loop          = asyncio.get_running_loop()
                     # Fresh queues — drain any stale audio from previous cycle
                     self.audio_in_queue = asyncio.Queue()
                     self.out_queue      = asyncio.Queue(maxsize=10)
@@ -389,6 +520,13 @@ class Jarvis:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Redirect stdout/stderr to a log file so that print() calls inside
+    # skills (and any library debug output) never corrupt the curses display.
+    _log_path = os.path.expanduser("~/.jarvis2.log")
+    _log_file = open(_log_path, "a", buffering=1)
+    sys.stdout = _log_file
+    sys.stderr = _log_file
+
     ui = JarvisUI()
     ui.start_input_loop()
 
@@ -400,10 +538,9 @@ def main() -> None:
         ui.write_log("SYS: Interrupted by user.")
         ui.shutdown()
     except Exception as e:
+        ui.write_log(f"ERR: {e}")
         ui.shutdown()
-        import time
-        time.sleep(0.1)  # Let the curses thread clean up the terminal
-        traceback.print_exc()
+        time.sleep(0.3)
 
 
 if __name__ == "__main__":

@@ -15,12 +15,13 @@ PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 MEMORY_PATH     = BASE_DIR / "memory" / "memory.json"
 
 # ── Obsidian vault ───────────────────────────────────────────────────────────
-OBSIDIAN_VAULT  = Path.home() / "Documents" / "Obsidian" / "Jarvis-Research"
+OBSIDIAN_BASE   = Path.home() / "Obsidian"            # registered vault root
+OBSIDIAN_VAULT  = OBSIDIAN_BASE / "Jarvis(GUIONES)"   # subfolder for Jarvis notes
 
 # ── Gemini models ────────────────────────────────────────────────────────────
 LIVE_MODEL      = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 TEXT_MODEL      = "gemini-2.5-flash"
-LITE_MODEL      = "gemini-2.5-flash-lite"
+LITE_MODEL      = "gemini-2.0-flash-lite"   # 1500 req/day free vs 20 de 2.5-flash-lite
 
 # ── Audio settings ───────────────────────────────────────────────────────────
 CHANNELS            = 1

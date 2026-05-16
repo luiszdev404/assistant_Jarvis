@@ -1,5 +1,5 @@
 """
-skills/open_app.py — Launch applications on Linux Fedora GNOME.
+skills/open_app.py — Launch applications on Linux GNOME.
 
 Strategy (in order):
   1. Direct binary lookup via shutil.which
@@ -22,7 +22,7 @@ _APP_MAP: dict[str, str] = {
     "google chrome":       "google-chrome",
     "chromium":            "chromium-browser",
     "firefox":             "firefox",
-    "brave":               "brave-browser",
+    "brave":               "brave",
     "edge":                "microsoft-edge",
     "opera":               "opera",
     # Communication
@@ -103,11 +103,13 @@ def _launch(cmd: str) -> bool:
     """
     Attempt to launch a command string.
     Supports commands with flags like 'libreoffice --writer'.
+    Each step is tried exactly once; returns immediately on first success
+    to prevent multiple instances from opening.
     """
     parts = cmd.split()
     binary = parts[0]
 
-    # 1. Direct binary
+    # 1. Direct binary — if found in PATH, Popen is the only attempt.
     if shutil.which(binary):
         try:
             subprocess.Popen(
@@ -116,32 +118,24 @@ def _launch(cmd: str) -> bool:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            time.sleep(0.8)
             return True
         except Exception as e:
             print(f"[open_app] Direct launch failed: {e}")
+            return False  # binary existed but failed — don't try other methods
 
-    # 2. gtk-launch (uses .desktop entry names)
-    desktop_names = [
-        binary,
-        binary.replace("-", ""),
-        binary.replace("_", "-"),
-        cmd.replace(" ", "-"),
-    ]
-    for dn in desktop_names:
-        try:
-            result = subprocess.run(
-                ["gtk-launch", dn],
-                capture_output=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                time.sleep(0.8)
-                return True
-        except Exception:
-            pass
+    # 2. gtk-launch — one attempt with the binary name only.
+    try:
+        result = subprocess.run(
+            ["gtk-launch", binary],
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return True
+    except Exception:
+        pass
 
-    # 3. gio launch (GNOME native)
+    # 3. gio launch — first matching .desktop file.
     import glob
     for pattern in [
         f"/usr/share/applications/{binary}*.desktop",
@@ -156,7 +150,6 @@ def _launch(cmd: str) -> bool:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                time.sleep(0.8)
                 return True
             except Exception:
                 pass
@@ -196,11 +189,6 @@ class OpenAppSkill(Skill):
 
         if _launch(resolved):
             return f"Opened {app_name}."
-
-        # If resolved differs from original, try the raw name too
-        if resolved.split()[0].lower() != app_name.lower():
-            if _launch(app_name):
-                return f"Opened {app_name}."
 
         return (
             f"Could not open {app_name}. "
